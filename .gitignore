@@ -1,0 +1,94 @@
+# ===================================================================
+#  Project-specific ignores for AI/ML Projects
+# ===================================================================
+# Datasets (do not commit to the repository)
+/data/
+
+# Experiment results (models, logs, figures, etc.)
+/results/
+*.log
+
+# Secrets and local settings
+.env
+.env.*
+local_settings.py
+
+
+# ===================================================================
+#  Virtual environments
+# ===================================================================
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+
+
+# ===================================================================
+#  Python cache and build artifacts
+# ===================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+
+
+# ===================================================================
+#  Test, coverage, and cache files
+# ===================================================================
+.cache/
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+
+# ===================================================================
+#  IDE / Editor settings
+# ===================================================================
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+
+# ===================================================================
+#  OS-specific files
+# ===================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+*.[Dd]esktop.ini

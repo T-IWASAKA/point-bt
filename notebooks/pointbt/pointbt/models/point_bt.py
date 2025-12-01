@@ -99,14 +99,14 @@ class Image2Feature(nn.Module):
     def forward(self, y): # 画像群の平坦化されたものを入力 ((batch x n(defaultでは100)) x image)
         z = self.backbone_nn(y)
         z = self.projector(z)
-        return z # b*n x hidden
+        return z # b*n x hidden (or b*n x projector_size)
 
 
 class RBCPointNet(nn.Module):
     """
 
     """
-    def __init__(self, backbone_nn, latent_id=None, projector=None):
+    def __init__(self, input_dim, output_dim):
         """
         Parameters
         ----------
@@ -118,10 +118,28 @@ class RBCPointNet(nn.Module):
 
         """
         super().__init__()
+        # ポイント1: kernel_size=1 の Conv1d
+        self.mlp = nn.Sequential(
+            nn.Conv1d(input_dim, 512, kernel_size=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Conv1d(512, output_dim, kernel_size=1),
+            nn.BatchNorm1d(output_dim),
+            nn.ReLU()
+        )
 
     def forward(self, ys): # 画像群の特徴量化されたものを入力((batch x n(defaultでは100)) x image)
-        #
-        return z
+        # 次元の入れ替え (Transpose)
+        ys = ys.transpose(1, 2) 
+        # ys の形: [Batch, input_dim, n]
+
+        ys = self.mlp(ys) # 各細胞ごとの独立した変換 (MLP)
+        # x の形: [Batch, output_dim, n]
+
+        ys = torch.max(ys, 2)[0] 
+        # x の形: [Batch, output_dim]
+        
+        return ys
 
 
 
@@ -130,7 +148,7 @@ class PointBT(nn.Module):
     single GPU version based on https://github.com/facebookresearch/barlowtwins
 
     """
-    def __init__(self, backbone_nn, latent_id, backborn_projector, projection_sizes, lambd, scale_factor=1):
+    def __init__(self, backbone_nn, latent_id, backbone_projector, point_input_dim, projection_sizes, lambd, scale_factor=1):
         """
         Parameters
         ----------
@@ -146,8 +164,9 @@ class PointBT(nn.Module):
 
         """
         super().__init__()
-        self.rbc_encorder = Image2Feature(backbone_nn, latent_id=latent_id, projector=backborn_projector)
-        self.pointnet = RBCPointNet()
+        self.rbc_encoder = Image2Feature(backbone_nn, latent_id=latent_id, projector=backbone_projector)
+        point_output_dim = projection_sizes[0]
+        self.pointnet = RBCPointNet(point_input_dim, point_output_dim)
         self.lambd = lambd
         self.scale_factor = scale_factor
         # projector
@@ -168,10 +187,10 @@ class PointBT(nn.Module):
         B, n, C, H, W = y1s.shape # 入力の形を取得、元に戻すときに使う
         y1s = y1s.flatten(0, 1)
         y2s = y2s.flatten(0, 1)
-        z1s = self.rbc_encorder(y1s)
-        z2s = self.rbc_encorder(y2s)
+        z1s = self.rbc_encoder(y1s)
+        z2s = self.rbc_encoder(y2s)
         z1s = z1s.view(B, n, -1) # 入力の形に戻す
-        z2s = z1s.view(B, n, -1) # 入力の形に戻す
+        z2s = z2s.view(B, n, -1) # 入力の形に戻す
 
         # 点群データのエンコード
         z1 = self.pointnet(z1s)

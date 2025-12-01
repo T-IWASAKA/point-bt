@@ -326,7 +326,7 @@ class VitForPointBT(nn.Module):
         # applyはnn.Module由来, module内のインスタンスに対して再帰的に関数を当てる
         self.apply(self._init_weights)
     
-    def forward(self, x, output_attentions=False):
+    def forward(self, x, output_attentions=False): # Attentionが欲しいときは自前て動かす必要がある
         # embedding
         embedding_output = self.embedding(x)
         # encoding
@@ -339,7 +339,7 @@ class VitForPointBT(nn.Module):
         if output_attentions:
             return (output, all_attentions)
         else:
-            return (output, None)
+            return output # 下流を考えAttentionを流していない
     
     def _init_weights(self, module):
         # モジュールごとに適切なものがあるので分ける

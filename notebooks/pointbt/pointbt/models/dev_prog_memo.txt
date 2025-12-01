@@ -6,3 +6,7 @@ barlowtwins.pyは特に変更なし、これは事前にVITを学習しておく
 
 point_bt.pyの中身はPointNetの実装部分以外完了
 
+251201
+point_bt.pyの中身はPointNetの実装含め概ね完了
+他のパーツを整備して動かすのみ
+

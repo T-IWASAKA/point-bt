@@ -79,92 +79,146 @@ class Dataset_SSL_add_BG(torch.utils.data.Dataset): # 二つの画像をセッ�
         return y1, y2, b1, b2
 
 
+# ===================== 書き換えた ===================== #
 
-def prep_rbc_and_bg_data(tif_file, patch_size=1024, goal=10000, check_ditect=True):
-    dat_smear = Smear_tiff(tif_file)
-    dat_smear.check_dimensions()
-    buffer = patch_size/2
-    bg_p = 0.01 # 現在は固定
+def get_patch_data(os_obj, loc, patch_size=1024):
+    """ 画像と二値マスクを取得 """
+    try:
+        wsi_img = os_obj.read_region(location=loc, level=0, size=(patch_size, patch_size)).convert("RGB")
+        img_arr = np.array(wsi_img, dtype=np.uint8)
+        del wsi_img
+    except OpenSlideError:
+        return None, None
 
-    # patchをランダムに取得するための組み合わせ
-    loc_pairs = list(itertools.product(range(0, dat_smear.dimensions[0]//patch_size), range(0, dat_smear.dimensions[1]//patch_size)))
-    # ランダムにシャッフルして順番にペアを取得
+    gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 10, 255, cv2.THRESH_OTSU + cv2.THRESH_BINARY_INV)
+    return img_arr, binary
+
+def extract_rbc_crops(img_arr, binary, patch_size=1024, rbc_radius=60, target_size=(128, 128)):
+    """ 孤立した赤血球を切り出す """
+    if img_arr is None: return [], []
+
+    # 連結成分抽出
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary)
+    if num_labels <= 1: return [], []
+
+    # 背景(label=0)除外
+    centroids = centroids[1:]
+    stats = stats[1:]
+    areas = stats[:, 4]
+
+    # 1. 高速フィルタリング (サイズ & 境界)
+    min_area = rbc_radius * rbc_radius / 3.5
+    max_area = rbc_radius * rbc_radius * 2
+    margin = 50
+    
+    valid_mask = (areas > min_area) & (areas < max_area) & \
+                 (centroids[:, 0] > margin) & (centroids[:, 0] < patch_size - margin) & \
+                 (centroids[:, 1] > margin) & (centroids[:, 1] < patch_size - margin)
+    
+    valid_indices = np.where(valid_mask)[0]
+    if len(valid_indices) == 0: return [], []
+
+    candidate_centroids = centroids[valid_indices]
+    candidate_areas = areas[valid_indices]
+
+    # 2. KDTreeによる孤立点判定
+    tree = KDTree(candidate_centroids)
+    neighbors_lst = tree.query_ball_point(candidate_centroids, rbc_radius)
+    is_isolated = [len(n) == 1 for n in neighbors_lst]
+
+    final_centroids = candidate_centroids[is_isolated]
+    final_areas = candidate_areas[is_isolated]
+
+    # 3. 画像切り出し
+    rbc_crops = []
+    pad = int(rbc_radius * 3)
+    img_padded = cv2.copyMakeBorder(img_arr, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(0,0,0))
+
+    for (cx, cy), area in zip(final_centroids, final_areas):
+        radius = np.sqrt(area / np.pi)
+        crop_r = int(1.03 * radius)
+        
+        x1, y1 = int(cx + pad - crop_r), int(cy + pad - crop_r)
+        x2, y2 = int(cx + pad + crop_r), int(cy + pad + crop_r)
+        
+        crop = img_padded[y1:y2, x1:x2]
+        if crop.size == 0: continue
+        
+        crop_resized = cv2.resize(crop, target_size, interpolation=cv2.INTER_LINEAR)
+        rbc_crops.append(crop_resized)
+
+    return rbc_crops, final_centroids
+
+def create_dataset_from_wsi(tif_file, patch_size=1024, goal=10000, check_detect=True):
+    """
+    WSIから赤血球画像のみを収集する
+    Return: [img1, img2, ...] (ペアではなく画像のリスト)
+    """
+    try:
+        os_obj = OpenSlide(tif_file)
+    except Exception as e:
+        print(f"File Open Error: {e}")
+        return []
+
+    dims = os_obj.dimensions
+    buffer = patch_size / 2
+    
+    loc_pairs = list(itertools.product(
+        range(0, dims[0] // patch_size), 
+        range(0, dims[1] // patch_size)
+    ))
     random.shuffle(loc_pairs)
 
-    total_image = deque()
-    #structural_line_image = deque()
-    #blurred_image = deque()
-
-    # ペアを順番に処理
-    #n = 0 # errorの判定に使用
-    with tqdm(total=goal, desc="total rbc", leave=False, position=1) as pbar:
+    total_data = deque()
+    
+    with tqdm(total=goal, desc="Collecting RBCs", leave=False, position=1) as pbar:
         for loc_n, xy in enumerate(loc_pairs):
-            if loc_n == len(loc_pairs) - 1:
-                print("All regions have been searched.")
-            x = int(xy[0]*patch_size + buffer)
-            y = int(xy[1]*patch_size + buffer)
+            if len(total_data) >= goal: break
+                
+            x = int(xy[0] * patch_size + buffer)
+            y = int(xy[1] * patch_size + buffer)
 
-            isolated_centroids, isolated_areasize = dat_smear.ditect_rbc(patch_size=patch_size, loc=(x, y), rbc_radius=60)
-            bg_size = 80
-            background_img, bg_x, bg_y = dat_smear.get_background_cor(patch_size=patch_size, loc=(x, y), rbc_size=bg_size, bg_p=bg_p)
-            if isolated_centroids is not None and background_img is not None: 
-                rbc_lst = dat_smear.get_rbcimage(isolated_centroids, isolated_areasize, loc=(x, y))
+            # 画像読み込み & RBC抽出
+            img_arr, binary = get_patch_data(os_obj, (x, y), patch_size)
+            if img_arr is None: continue
+            
+            rbc_crops, centroids = extract_rbc_crops(
+                img_arr, binary, patch_size=patch_size, rbc_radius=60
+            )
+            
+            if not rbc_crops: continue
 
-                # ======= ここから書き換え ======= #
-                for rgb_array in rbc_lst:
-                    if laplacian_filter(rgb_array, threshold=3):
-                        if detect_structural_line_spike(rgb_array):
-                            #structural_line_image.extend([rgb_array])
-                            pass
-                        else:
-                            total_image.extend([[rgb_array, background_img]]) # どちらもnp.array, 
-                            # print("RBC shape:", rgb_array.shape, "BG shape:", background_img.shape) -> RBC shape: (128, 128, 3) BG shape: (128, 128, 3)
-                            pbar.update(1)
+            # フィルタリング & 保存
+            for rbc_img in rbc_crops:
+                # ※ 外部フィルタ関数
+                if laplacian_filter(rbc_img, threshold=3):
+                    if detect_structural_line_spike(rbc_img):
+                        pass # ゴミ
                     else:
-                        pass
+                        total_data.append(rbc_img) # 画像単体を追加
+                        pbar.update(1)
+                        if len(total_data) >= goal: break
+                else:
+                    pass # ボケ
 
-                # ======= ここまで書き換え ======= #
+            # 確認用可視化 (ゴール達成時のみ)
+            if len(total_data) >= goal and check_detect:
+                _visualize_check(img_arr, centroids, len(total_data))
+                break
 
-                if len(total_image) > goal:
-                    #print("The goal has been reached.")
-                    if check_ditect:
-                        image_array = np.array(dat_smear.get_area(patch_size=patch_size, loc=(x, y)), dtype=np.uint8)
-                        plt.scatter(isolated_centroids[:,0],isolated_centroids[:,1],s=50, marker='h',c='orangered')
-                        ax = plt.gca()
-                        # 矩形の座標とサイズ
-                        rect = patches.Rectangle(
-                            (bg_y, bg_x),              # 左上座標（列, 行）
-                            bg_size, bg_size,  # 横幅, 高さ
-                            linewidth=2,
-                            edgecolor='red',
-                            facecolor='none'
-                        )
-
-                        # 矩形を追加
-                        ax.add_patch(rect)
-
-                        plt.imshow(image_array)#これは縦横 (y, x)
-                        plt.show()
-                    break
-            else:
-                dat_smear = Smear_tiff(tif_file)
-                pbar.update(0)
-                #n = 1
-                continue
-
-
-    total_image = list(total_image)
-    #blurred_image = list(blurred_image)
-    #structural_line_image = list(structural_line_image)
-    total_image = total_image[0:goal]
-
-    if check_ditect:
-        show_get_img2(total_image)
-        #show_get_img(structural_line_image)
-        #show_get_img(blurred_image)
+    os_obj.close()
+    
+    total_image = list(total_data)[:goal]
+    
+    if check_detect and len(total_image) > 0:
+        print(f"Collected {len(total_image)} images.")
+        _show_sample_grid(total_image[:16])
 
     return total_image
 
+
+# ===================== 書き換えた ===================== #
 
 def prep_dataset(total_image, splitn=1):
     if splitn > 1:

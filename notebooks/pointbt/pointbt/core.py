@@ -20,16 +20,18 @@ from transformers import get_linear_schedule_with_warmup
 
 import wandb
 
-from .models.simsiam import SimSiam
-from .models.simslr import CimCLR_RBC
+#from .src.models.simsiam import SimSiam
+#from .src.models.simslr import CimCLR_RBC
+from .src.models.barlowtwins import BarlowTwins
+
 from .src.data_handler import (
     get_clstoken,
     get_dr_feature,
-    prep_smeardata_ss_bgcor,
+    prep_smeardata_ssl,
     prep_validdataset_bg_lst
 )
 from .src.image_aug import SSLTransform, SSLTransform2
-from .models.vit import VitForClassification
+from .src.models.vit import VitForPointBT
 from .src.trainer import Trainer
 
 class BTRBC:
@@ -53,33 +55,31 @@ class BTRBC:
                 self.config = yaml.safe_load(f)
             self.config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
             self.config["config_path"] = config_path
-        self.model = VitForClassification(self.config)
+        self.model = VitForPointBT(self.config)
         self.model.load_state_dict(torch.load(model_path))
     
     def prep_data(
             self, exp_name: str=None, input_path: str=None,
             num_rbc=2000, show_imagedata=True,
             num_workers=2, pin_memory=True,
-            load_data = False,
-            dataset_save=True, save_path="rbc_bg_dataset.npz"
+            save_path="/"
             ):
         """ dataの読み込み, 背景画像でスライド間差を学習するためのデータセットを準備 """
         if exp_name is None:
             exp_name = "exp"
         self.config["exp_name"] = exp_name
         self.input_path = input_path
-        ssltf = SSLTransform2(crop_size=self.config["crop_size"])
-        train_loader, test_loader = prep_smeardata_ss_bgcor(
-            load_data=load_data,
+        ssltf = SSLTransform(crop_size=self.config["crop_size"])
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        train_loader, test_loader = prep_smeardata_ssl(
             path=input_path, 
             num_rbc=num_rbc, 
             show_imagedata=show_imagedata,
             batch_size=self.config["batch_size"], 
-            ssl_transform = ssltf,
+            ssl_transform=ssltf,
             shuffle=(True, False), 
             num_workers=num_workers, 
             pin_memory=pin_memory, 
-            dataset_save=dataset_save,
             save_path=save_path,
             )
         return train_loader, test_loader
@@ -108,14 +108,18 @@ class BTRBC:
         self.latent_id = btconfig["latent_id"]
         if model == "ss":
             self.latent_id = btconfig["latent_id"]
-            self.backbone = VitForClassification(self.config)
-            self.model = SimSiam(self.backbone, self.latent_id, btconfig["projection_sizes"])
+            self.backbone = VitForPointBT(self.config)
+            #self.model = SimSiam(self.backbone, self.latent_id, btconfig["projection_sizes"])
         elif model == "bgcor":
             self.latent_id = btconfig["latent_id"]
-            self.backbone = VitForClassification(self.config)
-            self.model = CimCLR_RBC(self.backbone, self.latent_id, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])            
+            self.backbone = VitForPointBT(self.config)
+            #self.model = CimCLR_RBC(self.backbone, self.latent_id, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])
+        elif model == "bt":
+            self.latent_id = btconfig["latent_id"]
+            self.backbone = VitForPointBT(self.config)
+            self.model = BarlowTwins(self.backbone, self.latent_id, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])          
         else:
-            self.model = VitForClassification(self.config)
+            self.model = VitForPointBT(self.config)
 
         # --- ▼ WandBの追記ここから ▼ ---
         # (オプション) モデルの勾配や構造を監視
@@ -168,7 +172,7 @@ class BTRBC:
 
         # --- ▼ WandBの追記ここから ▼ ---
         # 2. Artifactを作成
-        base_dir = "/workspace/data" # trainerの部分もハードになっている、後で変更したい
+        base_dir = "/workspace/wandbdata" # trainerの部分もハードになっている、後で変更したい
         artifact = wandb.Artifact(
             name=self.config["exp_name"], # 'my-vit-model'のような管理しやすい名前
             type="model",

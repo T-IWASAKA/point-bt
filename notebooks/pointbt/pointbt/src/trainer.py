@@ -34,7 +34,7 @@ class Trainer:
         assert config["intermediate_size"] == 4 * config["hidden_size"]
         assert config["image_size"] % config["patch_size"] == 0
         # keep track of the losses and accuracies
-        base_dir = "/workspace/data" #後で追加
+        base_dir = "/workspace/wandbdata" #後で追加
         train_losses, train_on_diags, train_off_diags = [], [], []
         test_losses, test_on_diags, test_off_diags = [], [], []
         

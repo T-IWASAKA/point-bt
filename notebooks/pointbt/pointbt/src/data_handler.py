@@ -16,6 +16,7 @@ from typing import Tuple
 import os
 import sys
 import cv2
+import glob
 
 import numpy as np
 import pandas as pd
@@ -29,54 +30,64 @@ import torchvision.transforms as transforms
 from sklearn.decomposition import PCA
 from sklearn.metrics import davies_bouldin_score
 
-from .RBC_loader import Smear_tiff, show_get_img, show_get_img2
+from openslide import OpenSlide, OpenSlideError
+from scipy.spatial import KDTree
 
 
-class SmearDataset_RBC_BG(torch.utils.data.Dataset):
+class SmearDataset_RBC(torch.utils.data.Dataset):
     """
-    # 赤血球とその近辺の背景画像をまとめたデータセット
-
+    画像をメモリに読み込む高速版
+    メモリ効率化のため、PILオブジェクトではなくnumpy配列(uint8)で保持する
     """
-    def __init__(
-            self,
-            image_lst
-        ):
-        self.image_lst = image_lst
+    def __init__(self, image_lst, transform=None):
+        self.transform = transform
+        self.images = [] 
+
+        print(f"Loading {len(image_lst)} images to memory...")
+        
+        for image_path in tqdm(image_lst):
+            # 1. 画像を開いてRGB変換
+            with Image.open(image_path) as img:
+                img = img.convert('RGB')
+                # 2. ここで numpy array (uint8) に変換してリストに入れる
+                #    これによりファイルハンドルは確実に閉じられ、メモリもコンパクトになる
+                self.images.append(np.array(img))
         
     def __len__(self):
-        return len(self.image_lst)
+        return len(self.images)
     
     def __getitem__(self, idx):
-        image_rbc = self.image_lst[idx][0]
-        image_bg = self.image_lst[idx][1]
+        # 3. 取り出す時に PIL Image に戻す
+        #    (多くのTorchvision TransformsはPIL入力を期待するため)
+        img_array = self.images[idx]
+        image_rbc = Image.fromarray(img_array)
 
-        return image_rbc, image_bg # ラベルとして背景画像を返す
+        # ここではtransformは適用しない（Dataset_SSL側でやるため）
+        # もしこのクラス単体で使うならここで self.transform(image_rbc) する
+        
+        return image_rbc
 
 
-class Dataset_SSL_add_BG(torch.utils.data.Dataset): # 二つの画像をセットで同じaugをかける
+class Dataset_SSL(torch.utils.data.Dataset): 
     """
-    # SSL用にAugをかけた二つの画像をセットにし、まとめたデータセット (背景もあるため2x2=4枚で1セット)
-    # BT用、Aug用のtransformはimage_aug.pyに記載
-    
+    SSL用: 1枚の画像から2つのAugmentationビューを作る
     """
     def __init__(self, mydataset, transform):
         if transform is None:
             raise ValueError('!! Give transform !!')
         self.transform = transform
-        if len(mydataset) > 1:
-            raise ValueError('!! Add a dataset that you have not SPLIT! !!')
-        self.input = mydataset[0] #mydatasetがlist形式のためmydataset[0]であることに注意　
-
+        self.input = mydataset 
 
     def __len__(self):
         return len(self.input)
 
     def __getitem__(self, idx):
-        rbc_np, bg_np = self.input[idx]
-        rbc = Image.fromarray(rbc_np) 
-        bg = Image.fromarray(bg_np)
-        y1, y2, b1, b2 = self.transform([rbc, bg])
-        return y1, y2, b1, b2
+        # input (SmearDataset_RBC) から PIL Image が返ってくる
+        rbc = self.input[idx]
+        
+        # transformで2枚の画像(y1, y2)に変換
+        y1, y2 = self.transform(rbc)
+        return y1, y2
 
 
 # ===================== 書き換えた ===================== #
@@ -150,10 +161,10 @@ def extract_rbc_crops(img_arr, binary, patch_size=1024, rbc_radius=60, target_si
 
     return rbc_crops, final_centroids
 
-def create_dataset_from_wsi(tif_file, patch_size=1024, goal=10000, check_detect=True):
+def create_dataset_from_wsi(tif_file, patch_size=1024, goal=10000, save_dir="", check_detect=True):
     """
     WSIから赤血球画像のみを収集する
-    Return: [img1, img2, ...] (ペアではなく画像のリスト)
+    Return: [img1, img2, ...] (ペアではなく画像のパスのリスト)
     """
     try:
         os_obj = OpenSlide(tif_file)
@@ -170,11 +181,11 @@ def create_dataset_from_wsi(tif_file, patch_size=1024, goal=10000, check_detect=
     ))
     random.shuffle(loc_pairs)
 
-    total_data = deque()
-    
+    save_paths = deque()
+    count = 0
     with tqdm(total=goal, desc="Collecting RBCs", leave=False, position=1) as pbar:
         for loc_n, xy in enumerate(loc_pairs):
-            if len(total_data) >= goal: break
+            if len(save_paths) >= goal: break
                 
             x = int(xy[0] * patch_size + buffer)
             y = int(xy[1] * patch_size + buffer)
@@ -196,73 +207,121 @@ def create_dataset_from_wsi(tif_file, patch_size=1024, goal=10000, check_detect=
                     if detect_structural_line_spike(rbc_img):
                         pass # ゴミ
                     else:
-                        total_data.append(rbc_img) # 画像単体を追加
+                        filename = f"{count:06}.png"
+                        # ==== 接頭辞はAxioScanに合わせたハードコード ====
+                        filename_only = os.path.basename(tif_file)
+                        filename_head = filename_only.split("_")[0]+filename_only.split("_")[1]+filename_only.split("_")[2]+filename_only.split(".")[0].split("-")[-1]
+                        # =============================================
+                        save_path = os.path.join(save_dir, filename_head+filename)
+                        img_bgr = cv2.cvtColor(rbc_img, cv2.COLOR_RGB2BGR)
+                        cv2.imwrite(save_path, img_bgr)
+                        save_paths.append(save_path) # 画像pathを追加
                         pbar.update(1)
-                        if len(total_data) >= goal: break
+                        count += 1
+                        if count >= goal: break
                 else:
                     pass # ボケ
 
             # 確認用可視化 (ゴール達成時のみ)
-            if len(total_data) >= goal and check_detect:
-                _visualize_check(img_arr, centroids, len(total_data))
+            if len(save_paths) >= goal and check_detect:
+                _visualize_check(img_arr, centroids, len(save_paths))
                 break
 
     os_obj.close()
     
-    total_image = list(total_data)[:goal]
-    
-    if check_detect and len(total_image) > 0:
-        print(f"Collected {len(total_image)} images.")
-        _show_sample_grid(total_image[:16])
+    if check_detect and len(save_paths) > 0:
+        print(f"Collected {len(save_paths)} images.")
+        _show_sample_grid(save_paths[:16])
 
-    return total_image
+    return list(save_paths)
+
+
+def _visualize_check(img_arr, centroids, count):
+    """ 検出位置の確認 """
+    plt.figure(figsize=(8, 8))
+    plt.imshow(img_arr)
+    if len(centroids) > 0:
+        plt.scatter(centroids[:, 0], centroids[:, 1], s=50, marker='h', c='orangered')
+    plt.title(f"Check: {count} images collected")
+    plt.show()
+
+def _show_sample_grid(images):
+    """ 収集した画像のグリッド表示 (単体画像用) """
+    if not images: return
+    num = len(images)
+    rows = (num - 1) // 4 + 1
+    fig = plt.figure(figsize=(8, rows * 2))
+    for i, img in enumerate(images):
+        ax = fig.add_subplot(rows, 4, i + 1)
+        ax.imshow(img)
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
 
 
 # ===================== 書き換えた ===================== #
 
+# ===================================================== #
+def laplacian_filter(rgb_array, threshold=10):
+    # RGB → グレースケール
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+
+    # ラプラシアンフィルタ
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+
+    # シャープネス（ピントの指標）
+    sharpness = laplacian.var()
+
+    return sharpness > threshold
+
+def detect_structural_line_spike(img_rgb, diff_thresh=5, window_ratio=0.2):
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+
+    # プロファイル取得
+    col_profile = np.mean(gray, axis=0)
+    row_profile = np.mean(gray, axis=1)
+
+    col_diff = np.abs(np.diff(col_profile))
+    row_diff = np.abs(np.diff(row_profile))
+
+    # スパイクが画像の中央付近に集中してるかをチェック
+    col_center = w // 2
+    row_center = h // 2
+    win_c = int(w * window_ratio)
+    win_r = int(h * window_ratio)
+
+    vertical_spike = np.max(col_diff[col_center - win_c: col_center + win_c]) > diff_thresh
+    horizontal_spike = np.max(row_diff[row_center - win_r: row_center + win_r]) > diff_thresh
+
+    return vertical_spike or horizontal_spike
+
+# ===================================================== #
+
 def prep_dataset(total_image, splitn=1):
     if splitn > 1:
         random.shuffle(total_image)
-        my_datasets = [SmearDataset_RBC_BG(i) for i in np.array_split(total_image, splitn)]
+        my_datasets = [SmearDataset_RBC(i) for i in np.array_split(total_image, splitn)]
     else:
-        my_datasets = [SmearDataset_RBC_BG(total_image)]
+        my_datasets = [SmearDataset_RBC(total_image)]
 
     return my_datasets
 
 
-def prep_bgcor_dataset(
+def prep_imagepath_dataset(
     image_path, 
     num_rbc=2000, 
     show_imagedata=True, 
     ssl_transform=None, 
-    data_save=False, 
-    save_path="rbc_bg_dataset.npz"
+    save_path="data/save/path"
     )  -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
-    if type(image_path) == str:
-        image_paths = [image_path]
-    elif type(image_path) == list:
-        image_paths = image_path
-
-    np_img_lst = []
-    for path in tqdm(image_paths, desc="Processing images", position=0):
-        total_image =  prep_rbc_and_bg_data(path, patch_size=1024, goal=num_rbc, check_ditect=show_imagedata)
-        np_img_lst.extend(total_image)
-
-    if data_save:
-        rbc_images = [pair[0] for pair in np_img_lst]
-        bg_images = [pair[1] for pair in np_img_lst]
-        rbc_array = np.array(rbc_images)
-        bg_array = np.array(bg_images)
-        np.savez_compressed(save_path, rbc=rbc_array, bg=bg_array)
-
-    return _create_and_split_dataset(np_img_lst, ssl_transform)
-
-def load_bgcor_dataset(npz_path, ssl_transform=None):
-    data = np.load(npz_path)
-    rbc_array = data['rbc']
-    bg_array = data['bg']
-
-    np_img_lst = [list(pair) for pair in zip(rbc_array, bg_array)]
+    if len(glob.glob(save_path+"/*.png")) > 0:
+        np_img_lst = glob.glob(save_path+"/*.png")
+    else:
+        np_img_lst = []
+        for path in tqdm(image_path, desc="Processing images", position=0):
+            total_image =  create_dataset_from_wsi(path, patch_size=1024, goal=num_rbc, save_dir=save_path, check_detect=show_imagedata)
+            np_img_lst.extend(total_image)
 
     return _create_and_split_dataset(np_img_lst, ssl_transform)
 
@@ -277,7 +336,7 @@ def _create_and_split_dataset(
     リストからデータセットを作成し、訓練/テスト用に分割する内部関数
     """
     smeardataset = prep_dataset(np_img_lst, splitn=1)
-    mydataset = Dataset_SSL_add_BG(smeardataset, ssl_transform)
+    mydataset = Dataset_SSL(smeardataset[0], ssl_transform)
     
     dataset_size = len(mydataset)
     train_size = int(split_ratio * dataset_size)
@@ -337,8 +396,7 @@ def _worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 
-def prep_smeardata_ss_bgcor(
-    load_data:bool=True,
+def prep_smeardata_ssl(
     path=None, 
     num_rbc=2000, 
     batch_size:int=0, 
@@ -346,16 +404,12 @@ def prep_smeardata_ss_bgcor(
     shuffle=(True, False),
     num_workers:int=2, 
     pin_memory:bool=True, 
-    dataset_save:bool=True,
-    save_path="rbc_bg_dataset.npz",
+    save_path="data/save/path",
     show_imagedata:bool=True
     ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    if load_data:
-        train_dataset, test_dataset = load_bgcor_dataset(path, ssl_transform=ssl_transform)
-    else:
-        train_dataset, test_dataset = prep_bgcor_dataset(
-            path, num_rbc=num_rbc, show_imagedata=show_imagedata, ssl_transform=ssl_transform, data_save=dataset_save, save_path=save_path 
-            )
+    train_dataset, test_dataset = prep_imagepath_dataset(
+        path, num_rbc=num_rbc, show_imagedata=show_imagedata, ssl_transform=ssl_transform, save_path=save_path 
+        )
 
     train_loader = prep_dataloader(
         train_dataset, batch_size, shuffle[0], num_workers, pin_memory
@@ -369,7 +423,7 @@ def prep_smeardata_ss_bgcor(
 
 
 
-# 以下downstream task用、適宜変更
+# 以下downstream task用、適宜変更 ==============================================================
 
 class Dataset_toViT2(torch.utils.data.Dataset):
     def __init__(self, mydataset):

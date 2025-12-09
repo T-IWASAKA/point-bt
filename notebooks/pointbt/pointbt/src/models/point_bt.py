@@ -183,6 +183,10 @@ class PointBT(nn.Module):
 
 
     def forward(self, y1s, y2s): # 2つの画像群を入力 (y1, y2はそれぞれ batch x n(defaultでは100) x image(hxwxc))
+        # y1s, y2s の入力形状: (Batch, n, H, W, C)
+        # 1. ここで permute を入れて (B, n, C, H, W) に直す
+        y1s = y1s.permute(0, 1, 4, 2, 3) 
+        y2s = y2s.permute(0, 1, 4, 2, 3)
         # 特徴量化
         B, n, C, H, W = y1s.shape # 入力の形を取得、元に戻すときに使う
         y1s = y1s.flatten(0, 1)

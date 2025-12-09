@@ -212,7 +212,7 @@ def create_dataset_from_wsi(tif_file, patch_size=1024, goal=10000, save_dir="", 
                         filename_only = os.path.basename(tif_file)
                         filename_head = filename_only.split("_")[0]+filename_only.split("_")[1]+filename_only.split("_")[2]+filename_only.split(".")[0].split("-")[-1]
                         # =============================================
-                        save_path = os.path.join(save_dir, filename_head+filename)
+                        save_path = os.path.join(save_dir, filename_head+"_"+filename) # _で区切ることで後のPointNetの側の群分けを可能にする、ここもハードコード
                         img_bgr = cv2.cvtColor(rbc_img, cv2.COLOR_RGB2BGR)
                         cv2.imwrite(save_path, img_bgr)
                         save_paths.append(save_path) # 画像pathを追加
@@ -315,8 +315,8 @@ def prep_imagepath_dataset(
     ssl_transform=None, 
     save_path="data/save/path"
     )  -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
-    if len(glob.glob(save_path+"/*.png")) > 0:
-        np_img_lst = glob.glob(save_path+"/*.png")
+    if len(glob.glob(os.path.join(save_path, "*.png"))) > 0:
+        np_img_lst = glob.glob(os.path.join(save_path, "*.png"))
     else:
         np_img_lst = []
         for path in tqdm(image_path, desc="Processing images", position=0):
@@ -409,6 +409,155 @@ def prep_smeardata_ssl(
     ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     train_dataset, test_dataset = prep_imagepath_dataset(
         path, num_rbc=num_rbc, show_imagedata=show_imagedata, ssl_transform=ssl_transform, save_path=save_path 
+        )
+
+    train_loader = prep_dataloader(
+        train_dataset, batch_size, shuffle[0], num_workers, pin_memory
+        )
+    test_loader = prep_dataloader(
+        test_dataset, batch_size, shuffle[1], num_workers, pin_memory
+        )    
+
+        
+    return train_loader, test_loader
+
+
+# 以下pointbt用、適宜変更 ==============================================================
+
+class PointDataset_RBC(torch.utils.data.Dataset):
+    """
+    画像をメモリに読み込む高速版
+    メモリ効率化のため、PILオブジェクトではなくnumpy配列(uint8)で保持する
+    """
+    def __init__(self, img_pair_lst):
+            """
+            Args:
+                img_pair_lst: List[Tuple[List[Array], List[Array]]]
+                            ([img1, ...], [img1, ...]) のタプルが入ったリスト
+            """
+            self.pairs = []
+
+            print(f"Loading {len(img_pair_lst)} pairs of image sets to memory...")
+
+            # 事前読み込みと軽量化 (uint8 numpy arrayで保持)
+            for set1, set2 in tqdm(img_pair_lst):
+                # set1, set2 はそれぞれ画像(PIL or Array)のリスト
+                # メモリ効率のため uint8 numpy array に統一して保持
+                processed_set1 = [self._process_img(img) for img in set1]
+                processed_set2 = [self._process_img(img) for img in set2]
+                
+                self.pairs.append((processed_set1, processed_set2))
+
+    def _process_img(self, img):
+        """画像を読み込み、軽量なnumpy uint8形式にするヘルパー"""
+        if isinstance(img, str): # パスの場合
+            with Image.open(img) as i:
+                return np.array(i.convert('RGB'))
+        elif isinstance(img, Image.Image): # PILの場合
+            return np.array(img.convert('RGB'))
+        elif isinstance(img, np.ndarray): # 既にnumpyの場合
+            return img.astype(np.uint8)
+        else:
+            raise TypeError("Unsupported image type")
+        
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        set1_arrays, set2_arrays = self.pairs[idx]
+        # 【修正2】 List[Array] のままだとDataLoaderでバッチ化できないため
+        # (100, H, W, C) の形状の Tensor または Array にスタックして返す
+        set1_stack = torch.from_numpy(np.stack(set1_arrays))
+        set2_stack = torch.from_numpy(np.stack(set2_arrays))
+        
+        return set1_stack, set2_stack
+
+def prep_pointnet_dataset(
+    image_path, 
+    num_rbc=2000, 
+    n_rbc_set = 100,
+    show_imagedata=True, 
+    save_path="data/save/path"
+    )  -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
+    os.makedirs(save_path, exist_ok=True)
+    img_pair__lst = []
+    if len(glob.glob(os.path.join(save_path, "*.png"))) > 0:
+        # ここの操作は後程考える
+        file_lst = list(glob.glob(os.path.join(save_path, "*.png")))
+        file_names = [os.path.basename(p) for p in file_lst]
+        fileset = list(set([i.split("_")[0] for i in file_names]))
+        for slidename in fileset:
+            total_image = [i for i in file_lst if os.path.basename(i).split("_")[0] == slidename]
+            imgs_per_pair = n_rbc_set * 2
+            num_pairs = len(total_image) // imgs_per_pair
+            # 内包表記でペアを作成
+            pair_lst = [
+                (
+                    total_image[i * imgs_per_pair : i * imgs_per_pair + n_rbc_set],       # Set 1 (前半)
+                    total_image[i * imgs_per_pair + n_rbc_set : (i + 1) * imgs_per_pair]  # Set 2 (後半)
+                )
+                for i in range(num_pairs)
+            ]
+            img_pair__lst.extend(pair_lst)
+
+    else:
+        for path in tqdm(image_path, desc="Processing images", position=0):
+            total_image =  create_dataset_from_wsi(path, patch_size=1024, goal=num_rbc, save_dir=save_path, check_detect=show_imagedata)
+            # 100枚ずつのセットを一つの点群とする、後程外からさわれるようにする
+            imgs_per_pair = n_rbc_set * 2
+            num_pairs = len(total_image) // imgs_per_pair
+
+            # 内包表記でペアを作成
+            pair_lst = [
+                (
+                    total_image[i * imgs_per_pair : i * imgs_per_pair + n_rbc_set],       # Set 1 (前半)
+                    total_image[i * imgs_per_pair + n_rbc_set : (i + 1) * imgs_per_pair]  # Set 2 (後半)
+                )
+                for i in range(num_pairs)
+            ]
+            img_pair__lst.extend(pair_lst)
+
+    return _create_point_dataset(img_pair__lst)
+
+
+def _create_point_dataset(
+    img_pair__lst, 
+    split_ratio: float = 0.8, 
+    random_seed: int = 24771
+    ):
+    """
+    リストからデータセットを作成し、訓練/テスト用に分割する内部関数
+    """
+    mydataset = PointDataset_RBC(img_pair__lst)
+    
+    dataset_size = len(mydataset)
+    train_size = int(split_ratio * dataset_size)
+    test_size = dataset_size - train_size
+
+    # --- 分割の再現性を確保 ---
+    generator = torch.Generator().manual_seed(random_seed)
+    train_dataset, test_dataset = random_split(
+        mydataset, [train_size, test_size], generator=generator
+    )
+
+    print("===============================================================================")
+    print("train:test =", str(len(train_dataset)),":", str(len(test_dataset)))
+    
+    return train_dataset, test_dataset
+
+
+def prep_smeardata_pointbt( #prep_smeardata_sslと同様外に持っていく関数
+    path=None, 
+    num_rbc=2000, 
+    batch_size:int=1, 
+    shuffle=(True, False),
+    num_workers:int=2, 
+    pin_memory:bool=True, 
+    save_path="data/save/path",
+    show_imagedata:bool=True
+    ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    train_dataset, test_dataset = prep_pointnet_dataset(
+        path, num_rbc=num_rbc, show_imagedata=show_imagedata, save_path=save_path 
         )
 
     train_loader = prep_dataloader(

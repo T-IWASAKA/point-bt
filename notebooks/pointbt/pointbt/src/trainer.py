@@ -143,7 +143,7 @@ class Trainer:
             total_on_diag += on_diag.item() #
             total_off_diag += off_diag.item() #
 
-        return total_loss/len(trainloader.dataset), total_on_diag/len(trainloader.dataset), total_off_diag/len(trainloader.dataset)# 全データセットのうちのいくらかという比率になっている
+        return total_loss/len(trainloader), total_on_diag/len(trainloader), total_off_diag/len(trainloader)# 全データセットのうちのいくらかという比率になっている
     
 
     @torch.no_grad()
@@ -168,8 +168,8 @@ class Trainer:
                 total_on_diag += on_diag.item() #
                 total_off_diag += off_diag.item() #
 
-        avg_loss = total_loss / len(testloader.dataset)
-        avg_on_diag = total_on_diag / len(testloader.dataset)
-        avg_off_diag = total_off_diag / len(testloader.dataset)
+        avg_loss = total_loss / len(testloader)
+        avg_on_diag = total_on_diag / len(testloader)
+        avg_off_diag = total_off_diag / len(testloader)
 
         return avg_loss, avg_on_diag, avg_off_diag

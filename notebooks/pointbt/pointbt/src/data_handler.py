@@ -11,7 +11,7 @@ data handler
 import random
 import pickle
 import itertools
-from collections import deque
+from collections import deque, defaultdict
 from typing import Tuple
 import os
 import sys
@@ -98,7 +98,7 @@ def get_patch_data(os_obj, loc, patch_size=1024):
         wsi_img = os_obj.read_region(location=loc, level=0, size=(patch_size, patch_size)).convert("RGB")
         img_arr = np.array(wsi_img, dtype=np.uint8)
         del wsi_img
-    except OpenSlideError:
+    except Exception:
         return None, None
 
     gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
@@ -231,7 +231,7 @@ def create_dataset_from_wsi(tif_file, patch_size=1024, goal=10000, save_dir="", 
     
     if check_detect and len(save_paths) > 0:
         print(f"Collected {len(save_paths)} images.")
-        _show_sample_grid(save_paths[:16])
+        _show_sample_grid(list(save_paths)[:16])
 
     return list(save_paths)
 
@@ -245,14 +245,15 @@ def _visualize_check(img_arr, centroids, count):
     plt.title(f"Check: {count} images collected")
     plt.show()
 
-def _show_sample_grid(images):
+def _show_sample_grid(image_paths):
     """ 収集した画像のグリッド表示 (単体画像用) """
-    if not images: return
-    num = len(images)
+    if not image_paths: return
+    num = len(image_paths)
     rows = (num - 1) // 4 + 1
     fig = plt.figure(figsize=(8, rows * 2))
-    for i, img in enumerate(images):
+    for i, path in enumerate(image_paths):
         ax = fig.add_subplot(rows, 4, i + 1)
+        img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
         ax.imshow(img)
         ax.axis('off')
     plt.tight_layout()
@@ -429,13 +430,11 @@ class PointDataset_RBC(torch.utils.data.Dataset):
     画像をメモリに読み込む高速版
     メモリ効率化のため、PILオブジェクトではなくnumpy配列(uint8)で保持する
     """
-    def __init__(self, img_pair_lst):
+    def __init__(self, img_pair_lst, resize=(64, 64)):
             """
-            Args:
-                img_pair_lst: List[Tuple[List[Array], List[Array]]]
-                            ([img1, ...], [img1, ...]) のタプルが入ったリスト
             """
             self.pairs = []
+            self.resize = resize
 
             print(f"Loading {len(img_pair_lst)} pairs of image sets to memory...")
 
@@ -449,16 +448,27 @@ class PointDataset_RBC(torch.utils.data.Dataset):
                 self.pairs.append((processed_set1, processed_set2))
 
     def _process_img(self, img):
-        """画像を読み込み、軽量なnumpy uint8形式にするヘルパー"""
+        """画像を読み込み、リサイズして、軽量なnumpy uint8形式にするヘルパー"""
+        
+        # PIL Image として処理するロジックに統一すると楽です
+        pil_img = None
+
         if isinstance(img, str): # パスの場合
             with Image.open(img) as i:
-                return np.array(i.convert('RGB'))
+                pil_img = i.convert('RGB')
         elif isinstance(img, Image.Image): # PILの場合
-            return np.array(img.convert('RGB'))
-        elif isinstance(img, np.ndarray): # 既にnumpyの場合
-            return img.astype(np.uint8)
+            pil_img = img.convert('RGB')
+        elif isinstance(img, np.ndarray): # numpyの場合
+            pil_img = Image.fromarray(img).convert('RGB')
         else:
             raise TypeError("Unsupported image type")
+        
+        # 2. ここでリサイズを実行！
+        if self.resize is not None:
+            pil_img = pil_img.resize(self.resize, resample=Image.BILINEAR)
+
+        # numpy (uint8) に戻して返す
+        return np.array(pil_img)
         
     def __len__(self):
         return len(self.pairs)
@@ -469,6 +479,8 @@ class PointDataset_RBC(torch.utils.data.Dataset):
         # (100, H, W, C) の形状の Tensor または Array にスタックして返す
         set1_stack = torch.from_numpy(np.stack(set1_arrays))
         set2_stack = torch.from_numpy(np.stack(set2_arrays))
+        set1_stack = set1_stack.float() / 255.0
+        set2_stack = set2_stack.float() / 255.0
         
         return set1_stack, set2_stack
 
@@ -481,20 +493,21 @@ def prep_pointnet_dataset(
     )  -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
     os.makedirs(save_path, exist_ok=True)
     img_pair__lst = []
-    if len(glob.glob(os.path.join(save_path, "*.png"))) > 0:
-        # ここの操作は後程考える
-        file_lst = list(glob.glob(os.path.join(save_path, "*.png")))
-        file_names = [os.path.basename(p) for p in file_lst]
-        fileset = list(set([i.split("_")[0] for i in file_names]))
-        for slidename in fileset:
-            total_image = [i for i in file_lst if os.path.basename(i).split("_")[0] == slidename]
+    all_files = glob.glob(os.path.join(save_path, "*.png"))
+    if len(all_files) > 0:
+        slide_dict = defaultdict(list)
+        for path in tqdm(all_files, desc="Grouping by Slide ID"):
+            filename = os.path.basename(path)
+            slide_id = filename.split("_")[0] # ID抽出 (ハードコードルール準拠)
+            slide_dict[slide_id].append(path)
+
+        for slide_id, images in tqdm(slide_dict.items(), desc="Creating pairs"):
             imgs_per_pair = n_rbc_set * 2
-            num_pairs = len(total_image) // imgs_per_pair
-            # 内包表記でペアを作成
+            num_pairs = len(images) // imgs_per_pair
             pair_lst = [
                 (
-                    total_image[i * imgs_per_pair : i * imgs_per_pair + n_rbc_set],       # Set 1 (前半)
-                    total_image[i * imgs_per_pair + n_rbc_set : (i + 1) * imgs_per_pair]  # Set 2 (後半)
+                    images[i * imgs_per_pair : i * imgs_per_pair + n_rbc_set],       # Set 1
+                    images[i * imgs_per_pair + n_rbc_set : (i + 1) * imgs_per_pair]  # Set 2
                 )
                 for i in range(num_pairs)
             ]
@@ -528,7 +541,7 @@ def _create_point_dataset(
     """
     リストからデータセットを作成し、訓練/テスト用に分割する内部関数
     """
-    mydataset = PointDataset_RBC(img_pair__lst)
+    mydataset = PointDataset_RBC(img_pair__lst, resize=(64, 64)) # ここは後で外からさわれるようにする、具体的にはcropサイズに変更
     
     dataset_size = len(mydataset)
     train_size = int(split_ratio * dataset_size)

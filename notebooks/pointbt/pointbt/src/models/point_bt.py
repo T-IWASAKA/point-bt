@@ -165,6 +165,7 @@ class PointBT(nn.Module):
         """
         super().__init__()
         self.rbc_encoder = Image2Feature(backbone_nn, latent_id=latent_id, projector=backbone_projector)
+        self.backbone = self.rbc_encoder.backbone_nn
         point_output_dim = projection_sizes[0]
         self.pointnet = RBCPointNet(point_input_dim, point_output_dim)
         self.lambd = lambd
@@ -211,4 +212,4 @@ class PointBT(nn.Module):
         off_diag = off_diagonal(c).pow_(2).sum()
         loss = self.scale_factor * (on_diag + self.lambd * off_diag)
 
-        return loss
+        return loss, on_diag, off_diag

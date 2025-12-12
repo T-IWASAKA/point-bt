@@ -28,10 +28,12 @@ from .src.data_handler import (
     get_clstoken,
     get_dr_feature,
     prep_smeardata_ssl,
+    prep_smeardata_pointbt,
     prep_validdataset_bg_lst
 )
 from .src.image_aug import SSLTransform, SSLTransform2
 from .src.models.vit import VitForPointBT
+from .src.models.point_bt import PointBT
 from .src.trainer import Trainer
 
 class BTRBC:
@@ -84,6 +86,29 @@ class BTRBC:
             )
         return train_loader, test_loader
     
+    def prep_data_pointbt(
+            self, exp_name: str=None, input_path: str=None,
+            num_rbc=2000,
+            num_workers=2, pin_memory=True,
+            save_path="/"
+            ):
+        """ dataの読み込み, 背景画像でスライド間差を学習するためのデータセットを準備 """
+        if exp_name is None:
+            exp_name = "exp"
+        self.config["exp_name"] = exp_name
+        self.input_path = input_path
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        train_loader, test_loader = prep_smeardata_pointbt(
+            path=input_path, 
+            num_rbc=num_rbc, 
+            batch_size=self.config["batch_size"], 
+            shuffle=(True, False),
+            num_workers=num_workers, 
+            pin_memory=pin_memory, 
+            save_path=save_path,
+            ) 
+        return train_loader, test_loader
+    
 
     def prep_data_ds(
             self, image_path,
@@ -104,7 +129,7 @@ class BTRBC:
 
     def fit(self, train_loader, test_loader, btconfig={}, model="ss", warmup=True, run=None):
         """ training """
-        # モデル等の準備 (Classの有無でSSとViTを切り替え)
+        # モデル等の準備
         self.latent_id = btconfig["latent_id"]
         if model == "ss":
             self.latent_id = btconfig["latent_id"]
@@ -117,7 +142,11 @@ class BTRBC:
         elif model == "bt":
             self.latent_id = btconfig["latent_id"]
             self.backbone = VitForPointBT(self.config)
-            self.model = BarlowTwins(self.backbone, self.latent_id, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])          
+            self.model = BarlowTwins(self.backbone, self.latent_id, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])     
+        elif model == "pointbt":
+            self.latent_id = btconfig["latent_id"]
+            self.model = PointBT(self.backbone, self.latent_id, self.backbone_projector, self.point_input_dim, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])   
+            #backbone_projector, point_input_dim については後からうまいこと定義する、一旦外から入れる
         else:
             self.model = VitForPointBT(self.config)
 

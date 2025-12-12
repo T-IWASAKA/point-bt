@@ -136,7 +136,7 @@ class SSLTransform:
             self.transform = transforms.Compose([
                 transforms.RandomResizedCrop(crop_size, scale=(0.95, 1.0), interpolation=Image.BICUBIC),#
                 transforms.RandomHorizontalFlip(p=0.5),#
-                random_rotation_transform(rr_prob=1., rr_degrees=[0,180]),## 初期値rr_degrees=[0,180], 90の倍数で回したい場合はrr_degrees=90
+                random_rotation_transform(rr_prob=1., rr_degrees=90),## 初期値rr_degrees=[0,180], 90の倍数で回したい場合はrr_degrees=90
                 transforms.RandomApply(
                     [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)], # default brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)]
                     p=0.8

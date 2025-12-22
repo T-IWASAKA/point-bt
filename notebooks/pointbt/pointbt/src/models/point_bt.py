@@ -142,8 +142,64 @@ class RBCPointNet(nn.Module):
         return ys
 
 
-
 class PointBT(nn.Module):
+    """
+    single GPU version based on https://github.com/facebookresearch/barlowtwins
+
+    """
+    def __init__(self, point_input_dim, projection_sizes, lambd, scale_factor=1):
+        """
+        Parameters
+        ----------
+        backbone_nn: Model
+
+        latent_id: name or index of the layer to be fed to the projection
+
+        projection_sizes: size of the hidden layers in the projection
+
+        lambd: tradeoff function
+
+        scale_factor: factor to scale loss by
+
+        """
+        super().__init__()
+        point_output_dim = projection_sizes[0]
+        self.pointnet = RBCPointNet(point_input_dim, point_output_dim)
+        self.lambd = lambd
+        self.scale_factor = scale_factor
+        # projector
+        sizes = projection_sizes
+        layers = []
+        for i in range(len(sizes) - 2):
+            layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=False)) # BatchNorm入れるのでbias=False
+            layers.append(nn.BatchNorm1d(sizes[i + 1]))
+            layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Linear(sizes[-2], sizes[-1], bias=False)) # BatchNorm入れるのでbias=False
+        self.projector = nn.Sequential(*layers)
+        # normalization layer for z1 and z2
+        self.bn = nn.BatchNorm1d(sizes[-1], affine=False)
+
+
+    def forward(self, y1s, y2s): # 2つの特徴量群を入力
+        # y1s, y2s の入力形状: (Batch, n, hidden)
+        # 点群データのBT
+        z1 = self.pointnet(y1s)
+        z2 = self.pointnet(y2s)
+        z1 = self.projector(z1)
+        z2 = self.projector(z2)
+        # empirical cross-correlation matrix
+        c = torch.mm(self.bn(z1).T, self.bn(z2))
+        c.div_(z1.shape[0])
+        # scaling
+        on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+        off_diag = off_diagonal(c).pow_(2).sum()
+        loss = self.scale_factor * (on_diag + self.lambd * off_diag)
+
+        return loss, on_diag, off_diag
+    
+
+# 以下特徴量化を含めて学習する際に使う、VRAMの容量的にしんどいか
+class PointBT_old(nn.Module):
     """
     single GPU version based on https://github.com/facebookresearch/barlowtwins
 

@@ -12,7 +12,7 @@ import numpy as np
 from .utils import save_experiment, save_checkpoint
 
 class Trainer:
-    def __init__(self, config, model, optimizer, scheduler, loss_fn, exp_name, device, wandb_run):
+    def __init__(self, config, model, optimizer, scheduler, loss_fn, exp_name, device, wandb_run, model_type):
         self.config = config
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -21,6 +21,7 @@ class Trainer:
         self.exp_name = exp_name
         self.device = device
         self.wandb_run = wandb_run
+        self.model_type = model_type
 
 
     def train(self, trainloader, testloader, save_model_evry_n_epochs=0):
@@ -80,11 +81,21 @@ class Trainer:
 
             if save_model_evry_n_epochs > 0 and (i + 1) % save_model_evry_n_epochs == 0 and i + 1 != config["epochs"]:
                 print("> Save checkpoint at epoch", i + 1)
-                save_checkpoint(self.exp_name, self.model.backbone.net, i + 1, base_dir)
+                if self.model_type == "bt":
+                    save_checkpoint(self.exp_name, self.model.backbone.net, i + 1, base_dir)
+                elif self.model_type == "pointbt":
+                    save_checkpoint(self.exp_name, self.model.pointnet, i + 1, base_dir)
+                else:
+                    save_checkpoint(self.exp_name, self.model, i + 1, base_dir)
             
             if test_loss < best_loss:
                 best_loss = test_loss
-                save_checkpoint(self.exp_name, self.model.backbone.net, i + 1, base_dir) #おそらくBTの場合はバックボーンだけを保存した方がいい
+                if self.model_type == "bt":
+                    save_checkpoint(self.exp_name, self.model.backbone.net, i + 1, base_dir)
+                elif self.model_type == "pointbt":
+                    save_checkpoint(self.exp_name, self.model.pointnet, i + 1, base_dir)
+                else:
+                    save_checkpoint(self.exp_name, self.model, i + 1, base_dir)
                 patience_counter = 0 # カウンターをリセット
                 best_epoch = i + 1
 
@@ -101,11 +112,10 @@ class Trainer:
             if patience_counter >= patience:
                 print("Early stopping triggered.")
                 print("best epoch = ", str(best_epoch))
-                save_experiment(
-                    self.exp_name, base_dir, config, self.model, train_losses, test_losses
-                    )
                 break # 学習ループを抜ける
-        
+        save_experiment(
+                self.exp_name, base_dir, config, self.model, train_losses, test_losses
+                )
         self.best_epoch = best_epoch
 
 

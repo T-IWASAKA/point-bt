@@ -33,7 +33,7 @@ from .src.data_handler import (
 )
 from .src.image_aug import SSLTransform, SSLTransform2
 from .src.models.vit import VitForPointBT
-from .src.models.point_bt import PointBT
+from .src.models.point_bt import PointBT, Image2Feature
 from .src.trainer import Trainer
 
 class BTRBC:
@@ -88,7 +88,7 @@ class BTRBC:
     
     def prep_data_pointbt(
             self, exp_name: str=None, input_path: str=None,
-            num_rbc=2000,
+            n_rbc_set=100, expansion_factor=10,
             num_workers=2, pin_memory=True,
             save_path="/"
             ):
@@ -99,14 +99,14 @@ class BTRBC:
         self.input_path = input_path
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         train_loader, test_loader = prep_smeardata_pointbt(
-            path=input_path, 
-            num_rbc=num_rbc, 
+            save_path=self.input_path,
+            n_rbc_set=n_rbc_set, 
+            expansion_factor=expansion_factor,
             batch_size=self.config["batch_size"], 
             shuffle=(True, False),
             num_workers=num_workers, 
             pin_memory=pin_memory, 
-            save_path=save_path,
-            ) 
+            )
         return train_loader, test_loader
     
 
@@ -145,7 +145,7 @@ class BTRBC:
             self.model = BarlowTwins(self.backbone, self.latent_id, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])     
         elif model == "pointbt":
             self.latent_id = btconfig["latent_id"]
-            self.model = PointBT(self.backbone, self.latent_id, self.backbone_projector, self.point_input_dim, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])   
+            self.model = PointBT(self.point_input_dim, btconfig["projection_sizes"], btconfig["lambd"], scale_factor=btconfig["scale_factor"])   
             #backbone_projector, point_input_dim については後からうまいこと定義する、一旦外から入れる
         else:
             self.model = VitForPointBT(self.config)
@@ -161,33 +161,35 @@ class BTRBC:
             optimizer = optim.AdamW(self.model.parameters(), lr=self.config["lr"], weight_decay=1e-2)
 
             # ウォームアップとコサイン減衰を組み合わせる設定
-            num_epochs = self.config["epochs"]
-            num_training_steps = len(train_loader) * num_epochs
-            num_warmup_steps = int(0.1 * num_training_steps)  # 例: 全体の10%をウォームアップにする
+            warmup_epochs = int(self.config["epochs"] * 0.1)
+            if warmup_epochs < 1: warmup_epochs = 1
+            cosine_epochs = self.config["epochs"] - warmup_epochs
 
             # ウォームアップスケジューラー
-            warmup_scheduler = get_linear_schedule_with_warmup(
-                optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.001, end_factor=1.0, total_iters=warmup_epochs
             )
 
             # コサイン減衰スケジューラー (ウォームアップ後に使う)
-            cosine_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - (num_warmup_steps / len(train_loader)))
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=cosine_epochs, eta_min=1e-6
+            )
 
             # スケジューラーを連結する
             scheduler = SequentialLR(
                 optimizer,
                 schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[num_warmup_steps]
+                milestones=[warmup_epochs]
             )
             # === ここまで ===
 
         else:
-            optimizer = optim.AdamW(self.model.parameters(), lr=self.config["lr"], weight_decay=1e-2)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+            optimizer = optim.AdamW(self.model.parameters(), lr=self.config["lr"], weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.config["epochs"])
 
         loss_fn = nn.CrossEntropyLoss()
         trainer = Trainer(
-            self.config, self.model, optimizer, scheduler, loss_fn, self.config["exp_name"], self.config["device"], run
+            self.config, self.model, optimizer, scheduler, loss_fn, self.config["exp_name"], self.config["device"], run, model
             )
         # training
         trainer.train(
@@ -213,9 +215,16 @@ class BTRBC:
         # --- ▲ WandBの追記ここまで ▲ ---
 
         best_weights = torch.load(best_model_path)
-        self.backbone.load_state_dict(best_weights)
 
-        return self.backbone
+        if model == "bt":
+            self.backbone.load_state_dict(best_weights)
+            return self.backbone
+        elif model == "pointbt":
+            self.model.pointnet.load_state_dict(best_weights)
+            return self.model.pointnet
+        else:
+            self.model.load_state_dict(best_weights)
+            return self.model
 
 
     def model_valid(self, dataset_lst, latent_id, f_type="mean+max"):

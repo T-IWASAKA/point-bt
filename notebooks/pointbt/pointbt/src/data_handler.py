@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm.notebook import tqdm
 import torch
+import torch.nn as nn
 import torch.utils.data as data
 from torch.utils.data import random_split
 import torchvision.transforms as transforms
@@ -32,6 +33,8 @@ from sklearn.metrics import davies_bouldin_score
 
 from openslide import OpenSlide, OpenSlideError
 from scipy.spatial import KDTree
+
+from .models.point_bt import Image2Feature
 
 
 class SmearDataset_RBC(torch.utils.data.Dataset):
@@ -425,112 +428,189 @@ def prep_smeardata_ssl(
 
 # 以下pointbt用、適宜変更 ==============================================================
 
+
+# === 1. 推論用のデータセット定義 ===
+class InferenceDataset(torch.utils.data.Dataset):
+    def __init__(self, file_paths, resize=(64, 64)):# resizeは後で外からさわれるようにする、具体的にはcropサイズに変更
+        self.file_paths = file_paths
+        self.transform = transforms.Compose([
+            transforms.Resize(resize), # PILのままリサイズの方が速いことが多い
+            transforms.ToTensor(),     # (C, H, W) になり、0-1に正規化される
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        ])
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, idx):
+        path = self.file_paths[idx]
+        with Image.open(path) as i:
+            pil_img = i.convert('RGB')
+        
+        img_tensor = self.transform(pil_img)
+        # ファイル名も返して、保存時に使う
+        filename = os.path.basename(path)
+        return img_tensor, filename
+
+# === 2. メインの変換関数 ===
+def image2feature(data_path, save_dir, backbone_nn, latent_id, backbone_projector, batch_size=256, device="cuda"):
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # ファイルリスト取得
+    all_files = glob.glob(os.path.join(data_path, "*.png"))
+    if not all_files:
+        print("画像が見つかりません！")
+        return
+
+    # Dataset & DataLoader (高速化の鍵)
+    dataset = InferenceDataset(all_files, resize=(64, 64))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    # モデルの準備
+    rbc_encoder = Image2Feature(backbone_nn, latent_id=latent_id, projector=backbone_projector)
+    rbc_encoder.to(device)
+    rbc_encoder.eval()  # ★重要: 評価モード
+
+    print(f"Start processing {len(all_files)} images...")
+
+    # ★重要: 勾配計算なしでメモリ節約
+    with torch.no_grad():
+        for images, filenames in tqdm(loader):
+            images = images.to(device) # (Batch, C, H, W)
+
+            # 推論 (Batch分まとめて計算)
+            features = rbc_encoder(images) # (Batch, Feature_Dim)
+
+            # GPUからCPUへ戻し、Numpy化
+            features = features.cpu().numpy().astype(np.float32) # ★重要: float32
+
+            # 1個ずつ保存
+            for i, filename in enumerate(filenames):
+                # 特徴量ベクトルを取り出す
+                feat_vec = features[i] 
+                
+                # 保存パス
+                save_name = os.path.splitext(filename)[0] + ".npz"
+                save_path = os.path.join(save_dir, save_name)
+                
+                # 保存
+                np.savez_compressed(save_path, feats=feat_vec) # ここのfeatsをprep_pointnet_dataset内のキーと一致させる必要あり
+
+    print("完了！")
+    
+
 class PointDataset_RBC(torch.utils.data.Dataset):
     """
-    画像をメモリに読み込む高速版
-    メモリ効率化のため、PILオブジェクトではなくnumpy配列(uint8)で保持する
+    特徴量ベクトル(npz)を扱う軽量版データセット
+    画像処理は事前に行われているため、ここでは単にデータを返すだけ
     """
-    def __init__(self, img_pair_lst, resize=(64, 64)):
-            """
-            """
-            self.pairs = []
-            self.resize = resize
+    def __init__(self, feature_pair_lst):
+        """
+        Args:
+            feature_pair_lst: List[Tuple[np.ndarray, np.ndarray]]
+            ペアになった特徴量配列のリスト。
+            各要素は ( (N, Dim), (N, Dim) ) の形になっていることを想定。
+        """
+        self.pairs = feature_pair_lst
+        print(f"Dataset initialized with {len(self.pairs)} pairs.")
 
-            print(f"Loading {len(img_pair_lst)} pairs of image sets to memory...")
-
-            # 事前読み込みと軽量化 (uint8 numpy arrayで保持)
-            for set1, set2 in tqdm(img_pair_lst):
-                # set1, set2 はそれぞれ画像(PIL or Array)のリスト
-                # メモリ効率のため uint8 numpy array に統一して保持
-                processed_set1 = [self._process_img(img) for img in set1]
-                processed_set2 = [self._process_img(img) for img in set2]
-                
-                self.pairs.append((processed_set1, processed_set2))
-
-    def _process_img(self, img):
-        """画像を読み込み、リサイズして、軽量なnumpy uint8形式にするヘルパー"""
-        
-        # PIL Image として処理するロジックに統一すると楽です
-        pil_img = None
-
-        if isinstance(img, str): # パスの場合
-            with Image.open(img) as i:
-                pil_img = i.convert('RGB')
-        elif isinstance(img, Image.Image): # PILの場合
-            pil_img = img.convert('RGB')
-        elif isinstance(img, np.ndarray): # numpyの場合
-            pil_img = Image.fromarray(img).convert('RGB')
-        else:
-            raise TypeError("Unsupported image type")
-        
-        # 2. ここでリサイズを実行！
-        if self.resize is not None:
-            pil_img = pil_img.resize(self.resize, resample=Image.BILINEAR)
-
-        # numpy (uint8) に戻して返す
-        return np.array(pil_img)
-        
     def __len__(self):
         return len(self.pairs)
     
     def __getitem__(self, idx):
-        set1_arrays, set2_arrays = self.pairs[idx]
-        # 【修正2】 List[Array] のままだとDataLoaderでバッチ化できないため
-        # (100, H, W, C) の形状の Tensor または Array にスタックして返す
-        set1_stack = torch.from_numpy(np.stack(set1_arrays))
-        set2_stack = torch.from_numpy(np.stack(set2_arrays))
-        set1_stack = set1_stack.float() / 255.0
-        set2_stack = set2_stack.float() / 255.0
+        # 既に (N, Dim) の numpy array になっているので、Tensorにするだけ
+        feat_set1, feat_set2 = self.pairs[idx]
         
-        return set1_stack, set2_stack
+        # float32に変換
+        set1_tensor = torch.from_numpy(feat_set1).float()
+        set2_tensor = torch.from_numpy(feat_set2).float()
+        
+        return set1_tensor, set2_tensor
 
 def prep_pointnet_dataset(
-    image_path, 
-    num_rbc=2000, 
-    n_rbc_set = 100,
-    show_imagedata=True, 
-    save_path="data/save/path"
-    )  -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
+    save_path="data/rbc_features", # npzの保存場所
+    n_rbc_set=100,
+    expansion_factor=10, # ★追加: データを何倍に拡張するか (疑似Augmentation)
+    split_ratio=0.8,
+    random_seed=24771
+    ) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
+    
     os.makedirs(save_path, exist_ok=True)
-    img_pair__lst = []
-    all_files = glob.glob(os.path.join(save_path, "*.png"))
+    feature_pair_lst = []
+
+    # npzファイルを探す
+    all_files = glob.glob(os.path.join(save_path, "*.npz"))
+    
+    # === A. 既に特徴量(npz)がある場合 ===
     if len(all_files) > 0:
+        print(f"Found {len(all_files)} feature files. Loading...")
+        
+        # 1. スライドIDごとにファイルをグルーピング
         slide_dict = defaultdict(list)
         for path in tqdm(all_files, desc="Grouping by Slide ID"):
             filename = os.path.basename(path)
-            slide_id = filename.split("_")[0] # ID抽出 (ハードコードルール準拠)
+            # ファイル名規則: "SlideID_....npz" を想定
+            slide_id = filename.split("_")[0]
             slide_dict[slide_id].append(path)
 
-        for slide_id, images in tqdm(slide_dict.items(), desc="Creating pairs"):
+        # 2. 各スライドごとにデータを読み込み、拡張しながらペアを作成
+        for slide_id, file_paths in tqdm(slide_dict.items(), desc="Creating Augmented Pairs"):
+            
+            # --- ここでスライド内の全特徴量をメモリにロード ---
+            # I/O回数を減らすため一気に読み込む
+            slide_features = []
+            for p in file_paths:
+                try:
+                    # np.loadは辞書形式を返すので、キー'feats'を指定
+                    # (前のコードで save_compressed(..., feats=...) とした想定)
+                    with np.load(p) as data:
+                        slide_features.append(data['feats'])
+                except Exception as e:
+                    print(f"Error loading {p}: {e}")
+                    continue
+            
+            if not slide_features:
+                continue
+                
+            # numpy arrayのリストになっているので、取り扱いやすいようにstackするかリストのままで
+            # ここではリストのまま扱います (要素は (Dim,) のベクトル)
+            
+            total_rbcs = len(slide_features)
             imgs_per_pair = n_rbc_set * 2
-            num_pairs = len(images) // imgs_per_pair
-            pair_lst = [
-                (
-                    images[i * imgs_per_pair : i * imgs_per_pair + n_rbc_set],       # Set 1
-                    images[i * imgs_per_pair + n_rbc_set : (i + 1) * imgs_per_pair]  # Set 2
-                )
-                for i in range(num_pairs)
-            ]
-            img_pair__lst.extend(pair_lst)
+            
+            # 特徴量が少なすぎてペアが作れない場合はスキップ
+            if total_rbcs < imgs_per_pair:
+                continue
 
+            # ★★★ 疑似Augmentation (Shuffle & Repeat) ★★★
+            # expansion_factor の回数だけ、シャッフルして異なる組み合わせを作る
+            for _ in range(expansion_factor):
+                # プールをコピーしてシャッフル
+                current_pool = slide_features.copy()
+                random.shuffle(current_pool)
+                
+                # ペア作成数
+                num_pairs = len(current_pool) // imgs_per_pair
+                
+                for i in range(num_pairs):
+                    # 前半セット (N, Dim)
+                    set1 = np.stack(current_pool[i * imgs_per_pair : i * imgs_per_pair + n_rbc_set])
+                    # 後半セット (N, Dim)
+                    set2 = np.stack(current_pool[i * imgs_per_pair + n_rbc_set : (i + 1) * imgs_per_pair])
+                    
+                    feature_pair_lst.append((set1, set2))
+
+    # === B. npzがない場合 (まだ特徴量抽出していない) ===
     else:
-        for path in tqdm(image_path, desc="Processing images", position=0):
-            total_image =  create_dataset_from_wsi(path, patch_size=1024, goal=num_rbc, save_dir=save_path, check_detect=show_imagedata)
-            # 100枚ずつのセットを一つの点群とする、後程外からさわれるようにする
-            imgs_per_pair = n_rbc_set * 2
-            num_pairs = len(total_image) // imgs_per_pair
+        raise FileNotFoundError(
+            f"No .npz files found in {save_path}. \n"
+            "Please run 'image2feature' function first to generate feature vectors!"
+        )
 
-            # 内包表記でペアを作成
-            pair_lst = [
-                (
-                    total_image[i * imgs_per_pair : i * imgs_per_pair + n_rbc_set],       # Set 1 (前半)
-                    total_image[i * imgs_per_pair + n_rbc_set : (i + 1) * imgs_per_pair]  # Set 2 (後半)
-                )
-                for i in range(num_pairs)
-            ]
-            img_pair__lst.extend(pair_lst)
-
-    return _create_point_dataset(img_pair__lst)
+    print(f"Total pairs generated: {len(feature_pair_lst)} (Expansion: x{expansion_factor})")
+    
+    # データセット作成
+    return _create_point_dataset(feature_pair_lst, split_ratio, random_seed)
 
 
 def _create_point_dataset(
@@ -541,7 +621,7 @@ def _create_point_dataset(
     """
     リストからデータセットを作成し、訓練/テスト用に分割する内部関数
     """
-    mydataset = PointDataset_RBC(img_pair__lst, resize=(64, 64)) # ここは後で外からさわれるようにする、具体的にはcropサイズに変更
+    mydataset = PointDataset_RBC(img_pair__lst)
     
     dataset_size = len(mydataset)
     train_size = int(split_ratio * dataset_size)
@@ -560,17 +640,16 @@ def _create_point_dataset(
 
 
 def prep_smeardata_pointbt( #prep_smeardata_sslと同様外に持っていく関数
-    path=None, 
-    num_rbc=2000, 
+    save_path="data/rbc_features",
+    n_rbc_set=100, 
+    expansion_factor=10,
     batch_size:int=1, 
     shuffle=(True, False),
     num_workers:int=2, 
     pin_memory:bool=True, 
-    save_path="data/save/path",
-    show_imagedata:bool=True
     ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     train_dataset, test_dataset = prep_pointnet_dataset(
-        path, num_rbc=num_rbc, show_imagedata=show_imagedata, save_path=save_path 
+        save_path=save_path, n_rbc_set=n_rbc_set, expansion_factor=expansion_factor
         )
 
     train_loader = prep_dataloader(

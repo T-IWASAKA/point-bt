@@ -1,0 +1,12 @@
+251128
+vit.pyの整備完了
+分類器を削除しアウトプットをCLSトークンに変更
+
+barlowtwins.pyは特に変更なし、これは事前にVITを学習しておくもの
+
+point_bt.pyの中身はPointNetの実装部分以外完了
+
+251201
+point_bt.pyの中身はPointNetの実装含め概ね完了
+他のパーツを整備して動かすのみ
+
